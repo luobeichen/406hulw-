@@ -1,0 +1,183 @@
+/* 测试环境
+ * Arduino ESP8266 2.3.0
+ * 可编程wifi继电器，本地控制示例代码
+ * 功能：1、S1切换点动和自锁模式
+ *       2、S1切换继电器状态
+ *       3、掉电记忆
+ */
+#include <Do.h>
+#include <Bigiot.h>
+
+DO bgt_do;
+BIGIOT bigiot;
+
+const String DEVICEID = "11196"; //设备ID
+const String APIKEY = "b976919d5"; //设备APIKEY
+const char* ssid = "406 not acceptalbe";//要连接的wifi名称
+const char* password = "wocaonimadeb";//wifi密码
+//=========================================================
+
+const char* serverIP = "www.bigiot.net";
+const int serverPort = 8181;
+unsigned long lastSw1Time = 0;
+unsigned long lastSw2Time = 0;
+unsigned long lastCheckStatusTime = 0;
+unsigned long lastPostTime = 0;
+unsigned int changeState = 0;
+const unsigned long postingInterval = 50000;
+unsigned long connectBigiotBeginTime = 0;//记录连接贝壳物联服务器开始时间
+bool isConnect = false;//是否连接贝壳物联
+
+/*
+ * 处理网络指令（来自贝壳物联平台）函数
+ * 参考贝壳物联通讯协议：http://www.bigiot.net/help/1.html
+ * json字符串解析参考，bigiot库文件中example文件夹
+ */
+void processWifiMessage(aJsonObject *msg)
+{
+  aJsonObject* method = aJson.getObjectItem(msg, "M");
+  if (!method) {
+    return;
+  }
+  String M = method->valuestring;
+  //如果连接到贝壳物联，发送登录信息
+  if (M == "WELCOME TO BIGIOT" || M == "connected")
+  {
+    bigiot.checkout(DEVICEID, APIKEY);//清除在线状态
+    delay(50);
+    bigiot.checkin(DEVICEID, APIKEY);//发送登录信息
+    return;
+  }
+  if (M == "say")
+  {
+    aJsonObject* content = aJson.getObjectItem(msg, "C");
+    aJsonObject* client_id = aJson.getObjectItem(msg, "ID");
+    if (!content || !client_id )return;
+    String C = content->valuestring;
+    String F_C_ID = client_id->valuestring;//可利用此ID判断命令来源
+    //如果是play吸合继电器，或点动
+    if (C == "play")
+    {
+      if (bgt_do.modeState == 0)
+      {
+        bgt_do.delayOn();
+        bgt_do.delayState = 1;
+      } else
+      {
+        bgt_do.delayOn();
+        delay(800);
+        bgt_do.delayOff();
+      }
+      return;
+    }
+    //如果是stop断开继电器
+    if (C == "stop")
+    {
+      bgt_do.delayOff();
+      bgt_do.delayState = 0;
+      return;
+    }
+    //如果是pause切换工作模式
+    if (C == "pause")
+    {
+      if (bgt_do.modeState == 0) {
+        bgt_do.led3On();
+        bgt_do.modeState = 1;
+        if (bgt_do.delayState == 1) {
+          bgt_do.delayOff();
+          bgt_do.delayState = 0;
+        }
+      } else {
+        bgt_do.led3Off();
+        bgt_do.modeState = 0;
+      }
+      return;
+    }
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  bgt_do.set_remember(true);//设置为掉电记忆模式，需在模块初始化之前
+  bgt_do.init();//初始化模块
+  bigiot.setDebug(false);//GPIO2是否输出串口调试信息
+  WiFi.begin(ssid, password);//连接wifi
+  Serial.print("\r\n");
+  Serial.print("BGT_DO_1.0\n");
+}
+
+void loop() {
+  delay(5);
+  unsigned long time_now = millis();
+  //检测S1是否被按下
+  if (digitalRead(bgt_do.sw1Pin) == LOW) {
+   bigiot.smartConfig(bgt_do.led3Pin);//进入smartconfig模式，并使led3闪烁
+    if (lastSw1Time == 0 || time_now - lastSw1Time > 500) {
+      lastSw1Time = time_now;
+      if (bgt_do.modeState == 0) {
+        bgt_do.led3On();//点亮LED3指示灯
+        bgt_do.modeState = 1;
+        if (bgt_do.delayState == 1) {
+          bgt_do.delayOff();//切换为点动模式时，断开继电器
+          bgt_do.delayState = 0;
+        }
+      } else {
+        bgt_do.led3Off();//LED3指示灯灭
+        bgt_do.modeState = 0;
+      }
+    }
+  }
+  //检测S2是否被按下
+  if (digitalRead(bgt_do.sw2Pin) == LOW) {
+    if (lastSw2Time == 0 || time_now - lastSw2Time > 500) {
+      lastSw2Time = time_now;
+      if (bgt_do.modeState == 0) {
+        if (bgt_do.delayState == 0) {
+          bgt_do.delayOn();//吸合继电器
+          bgt_do.delayState = 1;
+        } else {
+          bgt_do.delayOff();//断开继电器
+          bgt_do.delayState = 0;
+        }
+      } else {//点动模式吸合继电器1S断开
+        bgt_do.delayOn();
+        delay(1000);
+        bgt_do.delayOff();
+      }
+    }
+  }
+if (WiFi.status() == WL_CONNECTED) {
+    if (!bigiot.client.connected()) {
+      if (connectBigiotBeginTime == 0 || time_now - connectBigiotBeginTime > 5000) {
+        if (!bigiot.client.connect(serverIP, serverPort)) {
+          isConnect = false;
+          Serial.println("can not connect to bigiot.net");
+        } else {
+          isConnect = true;
+          Serial.println("connected to bigiot.net");
+        }
+        connectBigiotBeginTime = time_now;
+      }
+    }
+  } else {
+    return;
+  }
+  //定时查询设备是否在线
+  if ((time_now - lastCheckStatusTime > postingInterval || lastCheckStatusTime == 0) && isConnect) {
+    bigiot.status();
+    lastCheckStatusTime = time_now;
+  }
+  //接收网络指令，并处理
+  if (isConnect) {
+    while (bigiot.client.available())
+    {
+      int num = bigiot.client.available();
+      if (num < 8) break;
+      String wifiInputString = bigiot.client.readStringUntil('\n');
+      aJsonObject *msg = bigiot.getJsonObj(wifiInputString);
+      if (msg != NULL)processWifiMessage(msg);
+      aJson.deleteItem(msg);
+    }
+  }
+}
